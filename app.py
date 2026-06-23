@@ -26,6 +26,7 @@ import os
 import time
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -125,13 +126,28 @@ def yf_quote(symbol):
         return None, None, None
 
 
+def yf_batch(symbols):
+    """Busca varios simbolos do Yahoo EM PARALELO. Retorna {symbol: (price, change, row)}.
+    Isso evita que as secoes com muitos tickers (indices, commodities) estourem o
+    timeout de 4s do front por fazerem as chamadas em sequencia."""
+    symbols = list(dict.fromkeys(symbols))  # remove duplicados, mantem ordem
+    if not symbols:
+        return {}
+    out = {}
+    with ThreadPoolExecutor(max_workers=min(10, len(symbols))) as ex:
+        for sym, res in ex.map(lambda s: (s, yf_quote(s)), symbols):
+            out[sym] = res
+    return out
+
+
 def yf_many(spec):
-    """spec: lista de dicts já com fl/tk/nm/d/yahoo. Preenche price+change.
+    """spec: lista de dicts já com fl/tk/nm/d/yahoo. Preenche price+change (em paralelo).
     Retorna a lista de items prontos pro front. Item sem cotacao vira price=None."""
+    quotes = yf_batch([s["yahoo"] for s in spec])
     items = []
     got_any = False
     for s in spec:
-        price, change, _ = yf_quote(s["yahoo"])
+        price, change, _ = quotes.get(s["yahoo"], (None, None, None))
         if price is not None:
             got_any = True
         item = {k: s[k] for k in ("fl", "tk", "nm") if k in s}
@@ -274,20 +290,21 @@ def api_futuros():
 def api_juros():
     def build():
         items = []
-        # ── BR (Banco Central / SGS) ──
-        selic = bcb_sgs(432)   # Meta Selic definida pelo Copom (% a.a.)
-        cdi   = bcb_sgs(4389)  # CDI anualizado base 252 (% a.a.)
-        ipca  = bcb_sgs(433)   # IPCA — variacao mensal (%)
+        # ── BR (Banco Central / SGS) — em paralelo ──
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            selic, cdi, ipca = list(ex.map(bcb_sgs, [432, 4389, 433]))
+        # 432 = Meta Selic Copom (% a.a.) ; 4389 = CDI anualizado ; 433 = IPCA mensal (%)
         items.append({"fl": "🇧🇷", "tk": "SELIC", "nm": "Selic Meta", "price": selic, "change": None, "d": 2})
         items.append({"fl": "🇧🇷", "tk": "CDI",   "nm": "CDI Over",   "price": cdi,   "change": None, "d": 2})
         items.append({"fl": "🇧🇷", "tk": "IPCA",  "nm": "IPCA (mes)", "price": ipca,  "change": None, "d": 2})
-        # ── EUA (Treasuries via Yahoo) — 2A nao tem ticker limpo no Yahoo ──
-        for tk, nm, ysym in [("UST2", "T-Note 2A", None),
-                             ("UST10", "T-Note 10A", "^TNX"),
-                             ("UST30", "T-Bond 30A", "^TYX")]:
-            price = None
-            if ysym:
-                price, _, _ = yf_quote(ysym)
+        # ── EUA (Treasuries via Yahoo, em paralelo) — 2A nao tem ticker limpo ──
+        tre = yf_batch(["^TNX", "^TYX"])
+        ust = {
+            "UST2":  (None, "T-Note 2A"),
+            "UST10": (tre.get("^TNX", (None, None, None))[0], "T-Note 10A"),
+            "UST30": (tre.get("^TYX", (None, None, None))[0], "T-Bond 30A"),
+        }
+        for tk, (price, nm) in ust.items():
             items.append({"fl": "🇺🇸", "tk": tk, "nm": nm,
                           "price": round(price, 3) if price else None, "change": 0, "d": 3})
         got = any(i["price"] is not None for i in items)
@@ -316,31 +333,24 @@ def api_commodities():
 @app.route("/api/moedas")
 def api_moedas():
     def build():
-        pairs = ["USD-BRL", "EUR-BRL", "GBP-BRL", "JPY-BRL"]
-        meta = {
-            "USD": ("🇺🇸", "Dolar Comercial"),
-            "EUR": ("🇪🇺", "Euro"),
-            "GBP": ("🇬🇧", "Libra Esterlina"),
-            "JPY": ("🇯🇵", "Iene Japones"),
-        }
+        # Yahoo (ja confirmado funcionando no servidor) — AwesomeAPI estava dando 429.
+        spec = [
+            {"fl": "🇺🇸", "tk": "USD", "nm": "Dolar Comercial",  "yahoo": "USDBRL=X"},
+            {"fl": "🇪🇺", "tk": "EUR", "nm": "Euro",             "yahoo": "EURBRL=X"},
+            {"fl": "🇬🇧", "tk": "GBP", "nm": "Libra Esterlina",  "yahoo": "GBPBRL=X"},
+            {"fl": "🇯🇵", "tk": "JPY", "nm": "Iene Japones",     "yahoo": "JPYBRL=X"},
+        ]
+        quotes = yf_batch([s["yahoo"] for s in spec])
         items = []
-        try:
-            url = "https://economia.awesomeapi.com.br/json/last/" + ",".join(pairs)
-            r = requests.get(url, headers=UA, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()  # chaves no formato "USDBRL"
-            for code, (fl, nm) in meta.items():
-                d = data.get(code + "BRL")
-                if not d:
-                    continue
-                items.append({
-                    "fl": fl, "tk": code, "nm": nm,
-                    "bid": float(d["bid"]),
-                    "change": round(float(d.get("pctChange", 0)), 2),
-                })
-        except Exception as e:
-            app.logger.warning("AwesomeAPI falhou: %s", e)
-        return {"ok": bool(items), "data": {"items": items}}
+        got = False
+        for s in spec:
+            price, change, _ = quotes.get(s["yahoo"], (None, None, None))
+            if price is not None:
+                got = True
+            items.append({"fl": s["fl"], "tk": s["tk"], "nm": s["nm"],
+                          "bid": round(price, 4) if price else None,
+                          "change": change})
+        return {"ok": got, "data": {"items": items}}
     return jsonify(cached("moedas", CACHE_TTL, build))
 
 
@@ -430,14 +440,12 @@ def api_status():
     except Exception as e:
         out["banco_central"] = {"ok": False, "erro": str(e)[:160]}
 
-    # AwesomeAPI (moedas)
+    # Moedas (agora via Yahoo, junto com o resto)
     try:
-        r = requests.get("https://economia.awesomeapi.com.br/json/last/USD-BRL",
-                         headers=UA, timeout=HTTP_TIMEOUT)
-        out["awesomeapi_moedas"] = {"ok": r.status_code == 200 and "USDBRL" in r.json(),
-                                    "http": r.status_code}
+        p, _, _ = yf_quote("USDBRL=X")
+        out["moedas_yahoo"] = {"ok": p is not None, "amostra_usdbrl": round(p, 4) if p else None}
     except Exception as e:
-        out["awesomeapi_moedas"] = {"ok": False, "erro": str(e)[:160]}
+        out["moedas_yahoo"] = {"ok": False, "erro": str(e)[:160]}
 
     # Cripto (Binance.vision)
     try:
